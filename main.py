@@ -8,20 +8,33 @@ bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 gemini_key = os.environ.get('GEMINI_API_KEY', '').strip()
 supabase_key = os.environ.get('SUPABASE_KEY', '').strip()
 
-# إعداد الروابط
+# الروابط
 supabase_url = "https://maabijsnlytxewkscvam.supabase.co"
 bot = telebot.TeleBot(bot_token)
 
-# تشغيل مكتبة جوجل الرسمية (لحل مشكلة المفاتيح الجديدة)
+# تشغيل مكتبة جوجل
 genai.configure(api_key=gemini_key)
-ai_model = genai.GenerativeModel('gemini-1.5-flash')
+
+def get_ai_reply(prompt):
+    # القناص الذكي: تجربة أشهر الموديلات بالترتيب لضمان عمل أحدهم مع مفتاحك
+    models = ['gemini-pro', 'gemini-1.5-flash-latest', 'gemini-1.0-pro', 'gemini-1.5-pro']
+    last_err = ""
+    for m in models:
+        try:
+            model = genai.GenerativeModel(m)
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return f"لم ينجح أي موديل. آخر خطأ: {last_err}"
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
     first_name = message.from_user.first_name
     
-    msg = bot.reply_to(message, "جاري تشغيل العقل والذاكرة (بالمكتبة الرسمية)... ⏳")
+    msg = bot.reply_to(message, "جاري تشغيل العقل والذاكرة (النسخة الذكية)... ⏳")
     
     db_status = "✅ متصلة بنجاح"
 
@@ -47,16 +60,12 @@ def send_welcome(message):
     except Exception as e:
         db_status = f"⚠️ خطأ: {e}"
 
-    # 2. الاتصال بالعقل (Gemini عبر المكتبة الرسمية)
-    try:
-        prompt = f"أنت مساعد ذكي في مصنع فيديوهات وثائقية. رحب بشكل قصير جداً ومحفز بشخص اسمه {first_name} يستخدم النظام لأول مرة."
-        response = ai_model.generate_content(prompt)
-        ai_reply = response.text
-    except Exception as e:
-        ai_reply = f"خطأ اتصال بالعقل: {e}"
+    # 2. الاتصال بالعقل (Gemini)
+    prompt = f"أنت مساعد ذكي في مصنع فيديوهات وثائقية. رحب بشكل قصير جداً ومحفز بشخص اسمه {first_name} يستخدم النظام لأول مرة."
+    ai_reply = get_ai_reply(prompt)
 
     # 3. إرسال النتيجة النهائية
-    final_text = f"حالة المصنع الآلي (النسخة الاحترافية):\n🗄️ الذاكرة: {db_status}\n\n🤖 رد الذكاء الاصطناعي:\n{ai_reply}"
+    final_text = f"حالة المصنع الآلي (النسخة الذكية):\n🗄️ الذاكرة: {db_status}\n\n🤖 رد الذكاء الاصطناعي:\n{ai_reply}"
     bot.edit_message_text(final_text, chat_id=message.chat.id, message_id=msg.message_id)
 
 if __name__ == "__main__":
