@@ -1,6 +1,4 @@
 pyTelegramBotAPI
-supabase
-google-generativeai
-edge-tts
 requests
-pillow
+gTTS
+Pillow
