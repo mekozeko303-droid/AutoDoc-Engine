@@ -7,37 +7,32 @@ bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 gemini_key = os.environ.get('GEMINI_API_KEY', '').strip()
 supabase_key = os.environ.get('SUPABASE_KEY', '').strip()
 
-# تثبيت الرابط النظيف مباشرة لمنع أخطاء النسخ والأقواس
+# تثبيت الرابط النظيف مباشرة
 supabase_url = "https://maabijsnlytxewkscvam.supabase.co"
 
 bot = telebot.TeleBot(bot_token)
 
 def ask_gemini(prompt_text):
-    # تجربة أحدث موديلات جوجل بالترتيب لمنع خطأ 404 نهائياً
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+    # استخدام النسخة المستقرة لتفادي خطأ 503
     payload = {
         "contents": [{
             "parts": [{"text": prompt_text}]
         }]
     }
     
-    last_error = ""
-    for model_name in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
-        res = requests.post(url, json=payload, timeout=15)
-        if res.status_code == 200:
-            return res.json()['candidates'][0]['content']['parts'][0]['text']
-        else:
-            last_error = f"كود {res.status_code} ({res.text[:100]})"
-            
-    return f"تعذر الاتصال بـ Gemini: {last_error}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
+    res = requests.post(url, json=payload, timeout=15)
+    if res.status_code == 200:
+        return res.json()['candidates'][0]['content']['parts'][0]['text']
+    else:
+        return f"كود {res.status_code} ({res.text[:100]})"
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
     first_name = message.from_user.first_name
     
-    msg = bot.reply_to(message, "جاري الاتصال بالعقل والذاكرة (النسخة المحدثة)... ⏳")
+    msg = bot.reply_to(message, "جاري الاتصال بالعقل والذاكرة (النسخة المستقرة)... ⏳")
     
     db_status = "✅ متصلة بنجاح"
 
@@ -71,7 +66,7 @@ def send_welcome(message):
         ai_reply = f"خطأ اتصال بالذكاء الاصطناعي: {e}"
 
     # 3. إرسال النتيجة النهائية
-    final_text = f"حالة المصنع الآلي (التحديث الجديد):\n🗄️ الذاكرة: {db_status}\n\n🤖 رد الذكاء الاصطناعي:\n{ai_reply}"
+    final_text = f"حالة المصنع الآلي (مستقر):\n🗄️ الذاكرة: {db_status}\n\n🤖 رد الذكاء الاصطناعي:\n{ai_reply}"
     bot.edit_message_text(final_text, chat_id=message.chat.id, message_id=msg.message_id)
 
 if __name__ == "__main__":
