@@ -3,76 +3,133 @@ import io
 import re
 import sys
 import time
-import wave
-import base64
+import json
+import math
 import random
 import shutil
 import asyncio
 import subprocess
 import urllib.parse
 
-# 1. تثبيت وتحديث المكتبات (مع فرض تحديث edge-tts لأحدث نسخة)
-subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pyTelegramBotAPI", "requests", "edge-tts", "gTTS", "Pillow"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+# التأكد التلقائي من تثبيت المكتبات
+for pkg, mod in [
+    ("pyTelegramBotAPI", "telebot"),
+    ("requests", "requests"),
+    ("edge-tts", "edge_tts"),
+    ("gTTS", "gtts"),
+    ("Pillow", "PIL")
+]:
+    try:
+        __import__(mod)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import requests
 import edge_tts
 from gtts import gTTS
 from PIL import Image, ImageEnhance
 
-# 2. جلب المفاتيح السرية
+# ==========================================
+# 1. الإعدادات والمفاتيح وحماية البوت الشخصي
+# ==========================================
 bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 gemini_key = os.environ.get('GEMINI_API_KEY', '').strip()
-supabase_key = os.environ.get('SUPABASE_KEY', '').strip()
-supabase_url = "https://maabijsnlytxewkscvam.supabase.co"
+pixabay_key = os.environ.get('PIXABAY_API_KEY', '').strip()
+tg_api_id = os.environ.get('TELEGRAM_API_ID', '').strip()
+tg_api_hash = os.environ.get('TELEGRAM_API_HASH', '').strip()
 
 bot = telebot.TeleBot(bot_token)
 
-# 3. تصحيح الإملاء لضمان نطق عربي سليم وطبيعي
-def clean_arabic_text(text):
+# قفل البوت للاستخدام الشخصي فقط (يُربط تلقائياً بأول رسالة منك)
+OWNER_CHAT_ID = None
+USER_SESSION = {}
+
+# عدادات الموارد والحصص لإدارة الاستوديو
+SERVER_START_TIME = time.time()
+SERVER_MAX_SECONDS = 6 * 3600  # 6 ساعات لكل تشغيلة في GitHub Actions
+QUOTA_STATS = {
+    "gemini_daily_limit": 1500,
+    "gemini_used": 0,
+    "pixabay_hourly_limit": 5000,
+    "pixabay_used": 0,
+    "videos_produced": 0
+}
+
+VOICE_MAP = {
+    "الراوي": "ar-SA-HamedNeural",
+    "البطل": "ar-EG-ShakirNeural",
+    "شخصية": "ar-AE-HamdanNeural",
+    "الفتاة": "ar-AE-FatimaNeural"
+}
+
+def is_authorized(message):
+    global OWNER_CHAT_ID
+    user_id = message.from_user.id
+    if OWNER_CHAT_ID is None:
+        OWNER_CHAT_ID = user_id
+        return True
+    return user_id == OWNER_CHAT_ID
+
+def get_quota_dashboard_text():
+    elapsed = time.time() - SERVER_START_TIME
+    remaining_sec = max(0, SERVER_MAX_SECONDS - elapsed)
+    rem_hours = int(remaining_sec // 3600)
+    rem_mins = int((remaining_sec % 3600) // 60)
+
+    gemini_rem = max(0, QUOTA_STATS["gemini_daily_limit"] - QUOTA_STATS["gemini_used"])
+    pixabay_rem = max(0, QUOTA_STATS["pixabay_hourly_limit"] - QUOTA_STATS["pixabay_used"])
+    px_status = "✅ متصل ومفعل" if pixabay_key else "⚠️ غير مضاف (يعمل بالصور الذكية)"
+    max_possible_video_mins = max(1, int(remaining_sec // 25))
+
+    return (
+        "📊 **لوحة موارد الاستوديو الشخصي الآن:**\n"
+        f"⏱️ وقت السيرفر المتبقي: `{rem_hours} ساعة و {rem_mins} دقيقة`\n"
+        f"🧠 رصيد الذكاء الاصطناعي (Gemini): `{gemini_rem}` طلب متبقٍ\n"
+        f"🎬 رصيد فيديوهات Pixabay: `{pixabay_rem}` طلب ({px_status})\n"
+        f"📦 نظام رفع الملفات: `مفعل حتى 2GB (ضغط ذكي + تقسيم آلي)`\n"
+        f"🎥 الفيديوهات المنتجة في هذه الجلسة: `{QUOTA_STATS['videos_produced']}`\n"
+        f"⚡ أقصى مدة فيديو يمكنك إنتاجها الآن: `حتى {min(max_possible_video_mins, 30)} دقيقة`"
+    )
+
+# ==========================================
+# 2. تصحيح اللغة وتأليف السيناريو المقسم
+# ==========================================
+def clean_arabic(text):
     replacements = {
         "مدينه": "مدينة", "قلعه": "قلعة", "قريه": "قرية",
-        "دوله": "دولة", "حضاره": "حضارة", "قصه": "قصة",
-        "جزيره": "جزيرة", "عاصمه": "عاصمة", "تاريخيه": "تاريخية"
+        "دوله": "دولة", "حضاره": "حضارة", "قصه": "قصة", "جزيره": "جزيرة"
     }
-    words = text.split()
-    return " ".join([replacements.get(w, w) for w in words])
+    return " ".join([replacements.get(w, w) for w in text.split()])
 
-# 4. الاتصال بـ Gemini لكتابة نص وثائقي مترابط ومعلومات حقيقية
 def call_gemini(prompt_text):
-    models = [
-        'gemini-2.5-flash',
-        'gemini-2.5-flash-lite',
-        'gemini-2.0-flash',
-        'gemini-flash-latest'
-    ]
+    models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash', 'gemini-flash-latest']
     payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
 
     for model_name in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
         for _ in range(2):
             try:
-                res = requests.post(url, json=payload, timeout=25)
+                QUOTA_STATS["gemini_used"] += 1
+                res = requests.post(url, json=payload, timeout=30)
                 if res.status_code == 200:
                     return res.json()['candidates'][0]['content']['parts'][0]['text']
                 elif res.status_code == 429:
-                    time.sleep(2)
+                    time.sleep(3)
             except Exception:
                 pass
     return None
 
-def generate_documentary_plan(topic):
-    clean_topic = clean_arabic_text(topic)
+def generate_storyboard(topic, num_scenes):
+    clean_t = clean_arabic(topic)
     prompt = (
-        f"أنت كاتب أفلام وثائقية محترف في قناة الجزيرة الوثائقية. اكتب نصاً وثائقياً مترابطاً وسلساً جداً وكأنه يرويه حكواتي بشري عن: ({clean_topic}).\n"
-        "المطلوب 6 فقرات قصيرة متصلة السرد (كل فقرة جملة واحدة غنية بالمعلومات الحقيقية والتاريخية)، ومع كل فقرة وصف بصري دقيق باللغة الإنجليزية لتوليد الصورة.\n"
-        "اكتب 6 أسطر فقط بهذا الشكل الدقيق دون أي مقدمات أو نجوم أو تشكيل مبالغ فيه:\n"
-        "1|النص العربي للفقرة الأولى|Detailed English visual description for image 1\n"
-        "2|النص العربي للفقرة الثانية|Detailed English visual description for image 2\n"
-        "3|النص العربي للفقرة الثالثة|Detailed English visual description for image 3\n"
-        "4|النص العربي للفقرة الرابعة|Detailed English visual description for image 4\n"
-        "5|النص العربي للفقرة الخامسة|Detailed English visual description for image 5\n"
-        "6|النص العربي للفقرة السادسة والخاتمة|Detailed English visual description for image 6"
+        f"أنت مخرج سينمائي وكاتب قصص ووثائقيات محترف. اكتب سيناريو مترابطاً ومشوقاً جداً مكوناً من ({num_scenes}) مشهداً عن: ({clean_t}).\n"
+        "نوع بين السرد والحوار التمثيلي إذا كان الموضوع قصصياً مستخدماً الشخصيات التالية فقط: (الراوي، البطل، شخصية، الفتاة).\n"
+        "يجب أن تكتب كل مشهد في سطر واحد فقط مفصول بعلامة | بهذا التنسيق الدقيق دون أي مقدمات:\n"
+        "الشخصية|النص العربي للمشهد (جملتان مشوقتان)|two_word_english_video_search|Detailed English cinematic prompt for AI image generation\n"
+        "مثال:\n"
+        "الراوي|في قلب الجبال الشاهقة، ولدت أسطورة لم يمحها الزمن عبر القرون.|ancient mountain|Epic aerial cinematic shot of ancient fortress on mountain peak at sunset, photorealistic, 8k"
     )
     raw = call_gemini(prompt)
     scenes = []
@@ -80,346 +137,486 @@ def generate_documentary_plan(topic):
     if raw:
         for line in raw.splitlines():
             line = re.sub(r'[\*\#\`\"]', '', line).strip()
-            parts = line.split('|')
-            if len(parts) >= 3:
-                narration = clean_arabic_text(parts[1].strip())
-                img_prompt = parts[2].strip()
-                if len(narration) > 12:
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) >= 4:
+                char_name = parts[0]
+                if char_name not in VOICE_MAP:
+                    char_name = "الراوي"
+                narration = clean_arabic(parts[1])
+                v_query = re.sub(r'[^a-zA-Z0-9 ]', '', parts[2]).strip() or "cinematic nature"
+                img_prompt = parts[3]
+                if len(narration) > 10:
                     scenes.append({
-                        "narration": narration,
-                        "image_prompt": f"{img_prompt}, national geographic documentary photography, photorealistic, 8k, dramatic lighting, vertical 9:16"
+                        "character": char_name,
+                        "text": narration,
+                        "video_query": v_query,
+                        "image_prompt": f"{img_prompt}, cinematic lighting, national geographic style, photorealistic, 8k, vertical 9:16"
                     })
 
-    # ضمان 6 مشاهد كاملة دائماً
-    default_scenes = [
-        (f"تتربع {clean_topic} في قلب التاريخ كواحدة من أعرق الحواضر التي جمعت بين سحر الطبيعة وعبقرية الإنسان.", f"Epic aerial cinematic drone shot of {clean_topic} historic skyline and mountains, realistic documentary photography, 8k"),
-        (f"على قمم جبالها وبين أسوارها القديمة، شُيّدت القلاع والحصون الشامخة التي صمدت لقرون طويلة أمام تقلبات الزمان.", f"Ancient historical fortress and citadel on a mountain peak in {clean_topic}, golden sunlight, photorealistic, 8k"),
-        (f"وفي أزقتها العتيقة وأسواقها التراثية، ينبض بالحياة إرث ثقافي ومعماري فريد يعكس براعة البناء وروح الأصالة.", f"Old traditional heritage streets and historic architecture of {clean_topic}, cinematic street photography, 8k"),
-        (f"كما ازدهرت فيها المدارس التاريخية والمساجد الأثرية التي جعلت منها منارة للعلم والفكر والفنون عبر العصور.", f"Ancient historic domes, minarets, and stone courtyard in {clean_topic}, dramatic rays of light, photorealistic, 8k"),
-        (f"وتحيط بها المدرجات الخضراء والوديان الخصبة التي تمنح المكان لوحة طبيعية ساحرة تأسر قلوب الزائرين.", f"Lush green mountain terraces and dramatic valleys surrounding {clean_topic}, misty morning documentary shot, 8k"),
-        (f"لتبقى {clean_topic} اليوم شاهداً حياً ورمزاً خالداً يروي للأجيال قصة حضارة عريقة لا تنطفئ شمسها أبداً.", f"Breathtaking golden sunset panoramic view over {clean_topic} with warm glowing lights, masterpiece documentary, 8k")
+    # استكمال المشاهد تلقائياً إذا أرسل الذكاء الاصطناعي عدداً أقل
+    fallback_templates = [
+        ("الراوي", f"تبدأ حكايتنا مع {clean_t}، حيث تتقاطع أحداث التاريخ مع أسرار المكان في مشهد يخطف الأنفاس.", "ancient history", f"Cinematic wide angle shot representing {clean_t}, dramatic sky, 8k"),
+        ("البطل", f"كل زاوية في {clean_t} تروي فصلاً من التحدي والإصرار الذي صنعه الأجداد عبر السنين.", "walking desert", f"Close up dramatic portrait in historical setting of {clean_t}, cinematic lighting, 8k"),
+        ("شخصية", f"لم يكن الطريق سهلاً، لكن العزيمة حولت {clean_t} إلى أيقونة خالدة تدهش العالم.", "mountain clouds", f"Epic architectural and natural details of {clean_t}, golden hour sunlight, 8k"),
+        ("الراوي", f"وهكذا تستمر فصول {clean_t} حية في الذاكرة، شاهدة على عظمة الإنسان وروح الحضارة.", "sunset horizon", f"Breathtaking panoramic sunset over {clean_t}, cinematic masterpiece, 8k")
     ]
 
-    while len(scenes) < 6:
-        idx = len(scenes)
+    while len(scenes) < num_scenes:
+        idx = len(scenes) % len(fallback_templates)
+        tpl = fallback_templates[idx]
         scenes.append({
-            "narration": default_scenes[idx][0],
-            "image_prompt": default_scenes[idx][1]
+            "character": tpl[0],
+            "text": tpl[1],
+            "video_query": tpl[2],
+            "image_prompt": tpl[3]
         })
 
-    return scenes[:6]
+    return scenes[:num_scenes]
 
-# 5. توليد صوت بشري طبيعي ومتصل بالكامل (Gemini Native Human Audio + Edge Neural)
-async def _edge_human_tts(full_text, output_mp3):
-    # استخدام صوت شاكر الوثائقي الطبيعي بدون أي تشويه للترددات
-    voices = ["ar-EG-ShakirNeural", "ar-AE-HamdanNeural", "ar-SA-HamedNeural"]
-    for v in voices:
-        try:
-            comm = edge_tts.Communicate(text=full_text, voice=v, rate="+0%", pitch="+0Hz")
-            await comm.save(output_mp3)
-            if os.path.exists(output_mp3) and os.path.getsize(output_mp3) > 2000:
-                return True
-        except Exception:
-            continue
-    return False
+# ==========================================
+# 3. توليد الصوت البشري + الترجمة المضمونة 100%
+# ==========================================
+def format_srt_timestamp(seconds):
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-def generate_continuous_human_voice(scenes, output_mp3):
-    # دمج النص بالكامل في سرد بشري واحد متصل بوقفات تنفس طبيعية لمنع أي تقطيع
-    full_narration = " ، ... ".join([s["narration"].strip() for s in scenes]) + " ."
+async def _produce_edge_voice_and_ timings(text, voice, audio_path):
+    comm = edge_tts.Communicate(text, voice, rate="+0%", pitch="+0Hz")
+    word_events = []
+    with open(audio_path, "wb") as af:
+        async for chunk in comm.stream():
+            if chunk["type"] == "audio":
+                af.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                start_s = chunk["offset"] / 10_000_000.0
+                dur_s = chunk["duration"] / 10_000_000.0
+                word_events.append((start_s, start_s + dur_s, chunk["text"]))
+    return word_events
 
-    # المحرك الأول: صوت Gemini 2.5 البشري الطبيعي المباشر (Charon)
-    tts_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key={gemini_key}"
-    payload = {
-        "contents": [{"parts": [{"text": full_narration}]}],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {"voiceName": "Charon"}
-                }
-            }
-        }
-    }
+def generate_voice_and_srt(text, character, audio_path, srt_path):
+    voice = VOICE_MAP.get(character, "ar-SA-HamedNeural")
+    word_events = []
+
     try:
-        res = requests.post(tts_url, json=payload, timeout=35)
-        if res.status_code == 200:
-            part = res.json()['candidates'][0]['content']['parts'][0]
-            if 'inlineData' in part:
-                pcm_bytes = base64.b64decode(part['inlineData']['data'])
-                wav_tmp = output_mp3 + ".wav"
-                with wave.open(wav_tmp, 'wb') as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(24000)
-                    wf.writeframes(pcm_bytes)
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", wav_tmp,
-                    "-af", "apad=pad_dur=0.6",
-                    "-c:a", "libmp3lame", "-b:a", "192k", output_mp3
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                os.remove(wav_tmp)
-                if os.path.exists(output_mp3) and os.path.getsize(output_mp3) > 2000:
-                    return
+        word_events = asyncio.run(_produce_edge_voice_and_timings(text, voice, audio_path))
     except Exception:
         pass
 
-    # المحرك الثاني: المعلق البشري العصبي المحدّث من مايكروسوفت (شريط صوتي واحد متصل)
-    raw_mp3 = output_mp3 + "_raw.mp3"
-    try:
-        ok = asyncio.run(_edge_human_tts(full_narration, raw_mp3))
-        if ok:
-            subprocess.run([
-                "ffmpeg", "-y", "-i", raw_mp3,
-                "-af", "apad=pad_dur=0.6",
-                "-c:a", "libmp3lame", "-b:a", "192k", output_mp3
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            os.remove(raw_mp3)
-            return
-    except Exception:
-        pass
+    if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 1000:
+        gTTS(text=text, lang='ar').save(audio_path)
 
-    # بديل أخير في حال انقطاع كل السيرفرات
-    gTTS(text=full_narration, lang='ar').save(output_mp3)
-
-def get_audio_duration(audio_path):
+    # قياس مدة الصوت الحقيقية
     try:
         out = subprocess.check_output([
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1", audio_path
         ]).decode().strip()
-        return max(float(out), 18.0)
+        duration = max(float(out), 2.5)
     except Exception:
-        return 30.0
+        duration = 4.5
 
-# 6. جلب 6 صور حقيقية ومختلفة (Pollinations + Wikimedia Commons + Picsum)
-def fetch_wikimedia_photos(topic):
-    urls = []
-    headers = {"User-Agent": "AutoDocBot/3.0 (https://github.com/)"}
-    for lang in ["ar", "en"]:
+    # بناء ملف ترجمة SRT مضمون (تجميع كل 4-5 كلمات لسهولة القراءة)
+    srt_entries = []
+    if len(word_events) >= 2:
+        chunk_size = 5
+        for i in range(0, len(word_events), chunk_size):
+            group = word_events[i:i + chunk_size]
+            st = group[0][0]
+            et = max(group[-1][1], st + 0.6)
+            phrase = " ".join([w[2] for w in group])
+            srt_entries.append((st, et, phrase))
+    else:
+        # خطة بديلة رياضية دقيقة في حال لم يرسل السيرفر WordBoundary
+        words = text.split()
+        chunk_size = 5
+        chunks = [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+        if not chunks:
+            chunks = [text]
+        step = duration / len(chunks)
+        for idx, ch in enumerate(chunks):
+            srt_entries.append((idx * step, (idx + 1) * step, ch))
+
+    with open(srt_path, "w", encoding="utf-8") as sf:
+        for idx, (st, et, phrase) in enumerate(srt_entries, 1):
+            sf.write(f"{idx}\n{format_srt_timestamp(st)} --> {format_srt_timestamp(et)}\n{phrase}\n\n")
+
+    return duration
+
+# ==========================================
+# 4. جلب الفيديوهات الحقيقية (Pixabay) + الصور السينمائية (Flux)
+# ==========================================
+def fetch_scene_media(scene, scene_idx, work_dir):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0"}
+
+    # التنويع بين فيديوهات Pixabay الحقيقية وصور الذكاء الاصطناعي المطابقة للقصة
+    use_video_first = bool(pixabay_key) and (scene_idx % 2 == 0)
+
+    if use_video_first:
+        q = urllib.parse.quote(scene["video_query"])
+        vid_api = f"https://pixabay.com/api/videos/?key={pixabay_key}&q={q}&per_page=5&safesearch=true"
         try:
-            api = f"https://{lang}.wikipedia.org/w/api.php"
-            params = {
-                "action": "query", "generator": "search", "gsrsearch": topic,
-                "gsrlimit": 10, "prop": "pageimages", "piprop": "original", "format": "json"
-            }
-            r = requests.get(api, params=params, headers=headers, timeout=10)
-            pages = r.json().get("query", {}).get("pages", {})
-            for p in pages.values():
-                orig = p.get("original", {}).get("source", "")
-                if orig and orig.lower().endswith((".jpg", ".jpeg", ".png")):
-                    urls.append(orig)
+            QUOTA_STATS["pixabay_used"] += 1
+            r = requests.get(vid_api, headers=headers, timeout=12)
+            if r.status_code == 200:
+                hits = r.json().get("hits", [])
+                if hits:
+                    chosen = hits[scene_idx % len(hits)]
+                    videos_dict = chosen.get("videos", {})
+                    video_url = (
+                        videos_dict.get("medium", {}).get("url")
+                        or videos_dict.get("small", {}).get("url")
+                        or videos_dict.get("large", {}).get("url")
+                    )
+                    if video_url:
+                        v_path = os.path.join(work_dir, f"raw_media_{scene_idx}.mp4")
+                        vr = requests.get(video_url, headers=headers, timeout=20)
+                        if vr.status_code == 200 and len(vr.content) > 20000:
+                            with open(v_path, "wb") as vf:
+                                vf.write(vr.content)
+                            return {"type": "video", "path": v_path}
         except Exception:
             pass
-    return urls
 
-def save_formatted_image(raw_bytes, output_path):
-    img = Image.open(io.BytesIO(raw_bytes)).convert('RGB')
-    w, h = img.size
-    # قص أي علامة مائية سفلية وضبط نسبة الأبعاد للعرض العمودي
-    img = img.crop((0, 0, w, int(h * 0.94)))
-    img = img.resize((900, 1600), Image.Resampling.LANCZOS)
-    img = ImageEnhance.Contrast(img).enhance(1.08)
-    img = ImageEnhance.Color(img).enhance(1.15)
-    img.save(output_path, "JPEG", quality=95)
+    # توليد صورة سينمائية مطابقة للمشهد عبر Pollinations Flux
+    img_path = os.path.join(work_dir, f"raw_media_{scene_idx}.jpg")
+    encoded_p = urllib.parse.quote(scene["image_prompt"])
+    seed = random.randint(10000, 999999) + scene_idx * 555
 
-def download_all_scene_images(scenes, topic, work_dir):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
-    wiki_urls = fetch_wikimedia_photos(topic)
-    image_paths = []
+    for model_type in ["flux", "turbo"]:
+        poll_url = f"https://image.pollinations.ai/prompt/{encoded_p}?width=768&height=1344&seed={seed}&nologo=true&model={model_type}"
+        try:
+            ir = requests.get(poll_url, headers=headers, timeout=25)
+            if ir.status_code == 200 and len(ir.content) > 8000:
+                img = Image.open(io.BytesIO(ir.content)).convert("RGB")
+                w, h = img.size
+                img = img.crop((0, 0, w, int(h * 0.94))).resize((720, 1280), Image.Resampling.LANCZOS)
+                img = ImageEnhance.Contrast(img).enhance(1.08)
+                img.save(img_path, "JPEG", quality=92)
+                return {"type": "image", "path": img_path}
+        except Exception:
+            pass
 
-    for i, scene in enumerate(scenes):
-        out_path = os.path.join(work_dir, f"img_{i}.jpg")
-        saved = False
-        encoded = urllib.parse.quote(scene["image_prompt"])
-        models = ["flux", "turbo"]
+    # بديل Pixabay للصور الفوتوغرافية إذا تأخر مولد الصور
+    if pixabay_key:
+        try:
+            QUOTA_STATS["pixabay_used"] += 1
+            q = urllib.parse.quote(scene["video_query"])
+            p_url = f"https://pixabay.com/api/?key={pixabay_key}&q={q}&image_type=photo&per_page=5"
+            pr = requests.get(p_url, headers=headers, timeout=12)
+            if pr.status_code == 200 and pr.json().get("hits"):
+                hits = pr.json()["hits"]
+                img_u = hits[scene_idx % len(hits)]["largeImageURL"]
+                ir = requests.get(img_u, headers=headers, timeout=15)
+                img = Image.open(io.BytesIO(ir.content)).convert("RGB").resize((720, 1280), Image.Resampling.LANCZOS)
+                img.save(img_path, "JPEG", quality=92)
+                return {"type": "image", "path": img_path}
+        except Exception:
+            pass
 
-        # المحاولة عبر Pollinations بموديلات وبذور مختلفة
-        for m in models:
-            seed = random.randint(10000, 999999) + (i * 1337)
-            url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=1344&seed={seed}&nologo=true&model={m}"
-            try:
-                res = requests.get(url, headers=headers, timeout=25)
-                if res.status_code == 200 and len(res.content) > 8000:
-                    save_formatted_image(res.content, out_path)
-                    saved = True
-                    time.sleep(1.5)
-                    break
-            except Exception:
-                pass
-
-        # البديل الثاني: صور حقيقية من ويكيبيديا لنفس الموضوع
-        if not saved and wiki_urls:
-            while wiki_urls:
-                w_url = wiki_urls.pop(0)
-                try:
-                    res = requests.get(w_url, headers=headers, timeout=15)
-                    if res.status_code == 200 and len(res.content) > 8000:
-                        save_formatted_image(res.content, out_path)
-                        saved = True
-                        break
-                except Exception:
-                    pass
-
-        # البديل الثالث: صور فوتوغرافية عالية الدقة لضمان عدم ظهور شاشة فارغة أبداً
-        if not saved:
-            try:
-                pic_url = f"https://picsum.photos/seed/{int(time.time()) + i*99}/900/1600"
-                res = requests.get(pic_url, headers=headers, timeout=15)
-                if res.status_code == 200:
-                    save_formatted_image(res.content, out_path)
-                    saved = True
-            except Exception:
-                pass
-
-        if not saved:
-            Image.new('RGB', (900, 1600), color=(25, 35, 60)).save(out_path, "JPEG")
-
-        image_paths.append(out_path)
-
-    return image_paths
-
-# 7. تحريك الكاميرا القوي والمتنوع (6 حركات سينمائية مختلفة)
-def render_animated_scene(img_path, duration, move_index, seg_path):
-    fps = 25
-    frames = max(int(duration * fps), 50)
-    fade_out_start = max(duration - 0.4, 0.5)
-
-    # 6 حركات كاميرا قوية وواضحة (تقريب قوي، تبعيد، تحريك أفقي، تحريك عمودي، وحركة قطرية)
-    movements = [
-        # 1. زوم أمامي قوي وسلس (1.0 -> 1.38)
-        f"z='1.0+0.38*(on/{frames})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-        # 2. زوم عكسي سينمائي من الداخل للخارج (1.38 -> 1.0)
-        f"z='1.38-0.38*(on/{frames})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-        # 3. حركة بانورامية من اليسار إلى اليمين مع تقريب
-        f"z='1.28':x='(iw-iw/zoom)*(on/{frames})':y='(ih-ih/zoom)/2'",
-        # 4. حركة بانورامية من اليمين إلى اليسار مع تقريب
-        f"z='1.28':x='(iw-iw/zoom)*(1-on/{frames})':y='(ih-ih/zoom)/2'",
-        # 5. حركة كاميرا عمودية من الأسفل للأعلى مع زوم
-        f"z='1.26':x='(iw-iw/zoom)/2':y='(ih-ih/zoom)*(1-on/{frames})'",
-        # 6. حركة قطرية ديناميكية مع تقريب تدريجي
-        f"z='1.12+0.28*(on/{frames})':x='(iw-iw/zoom)*(on/{frames})':y='(ih-ih/zoom)*(on/{frames})'"
-    ]
-    chosen_move = movements[move_index % len(movements)]
-
-    vf = (
-        f"scale=900:1600,"
-        f"zoompan={chosen_move}:d={frames}:s=720x1280:fps={fps},"
-        f"fade=t=in:st=0:d=0.35,fade=t=out:st={fade_out_start:.2f}:d=0.35"
-    )
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", img_path,
-        "-vf", vf,
-        "-t", f"{duration:.2f}",
-        "-c:v", "libx264", "-preset", "veryfast",
-        "-pix_fmt", "yuv420p",
-        seg_path
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
-
-# 8. أوامر البوت وتوليد الفيديو
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.from_user.id
-    first_name = message.from_user.first_name or "صديقي"
+    # بديل أخير من Picsum
     try:
-        headers = {"apikey": supabase_key, "Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json"}
-        res = requests.get(f"{supabase_url}/rest/v1/users?telegram_id=eq.{user_id}", headers=headers, timeout=10)
-        if res.status_code == 200 and len(res.json()) == 0:
-            requests.post(f"{supabase_url}/rest/v1/users", headers=headers, json={
-                "telegram_id": user_id, "username": first_name, "client_code": f"USER_{user_id}"
-            }, timeout=10)
+        pic_r = requests.get(f"https://picsum.photos/seed/{seed}/720/1280", headers=headers, timeout=12)
+        if pic_r.status_code == 200:
+            with open(img_path, "wb") as f:
+                f.write(pic_r.content)
+            return {"type": "image", "path": img_path}
     except Exception:
         pass
 
-    bot.reply_to(
-        message,
-        f"أهلاً بك يا {first_name} في مصنع الوثائقيات السينمائي (نسخة الـ 6 مشاهد والصوت البشري المتصل)! 🎬🎙️\n\n"
-        "✨ المزايا المفعّلة الآن:\n"
-        "• 6 مشاهد مصورة متلاحقة لكل فيديو\n"
-        "• 6 حركات كاميرا قوية ومتنوعة (زوم، تبعيد، تحريك بانورامي وقطري)\n"
-        "• تعليق صوتي بشري متصل بالكامل بدون أي تقطيع بين الجمل\n\n"
-        "📌 أرسل الآن اسم الموضوع (مثل: مدينة تعز) لتجربة الإصدار الجديد!"
+    Image.new("RGB", (720, 1280), color=(20, 28, 48)).save(img_path, "JPEG")
+    return {"type": "image", "path": img_path}
+
+# ==========================================
+# 5. محرك المونتاج السينمائي (FFmpeg Studio Level 5)
+# ==========================================
+def render_scene_clip(media_info, audio_file, srt_file, output_clip, duration, scene_idx, work_dir):
+    fps = 25
+    frames = max(int(duration * fps), 40)
+    fade_out_st = max(duration - 0.4, 0.4)
+
+    # استخدام مسارات نسبية داخل مجلد العمل لمنع أي خطأ في فلتر الترجمة
+    rel_media = os.path.basename(media_info["path"])
+    rel_audio = os.path.basename(audio_file)
+    rel_srt = os.path.basename(srt_file)
+    rel_out = os.path.basename(output_clip)
+
+    sub_style = (
+        f"subtitles={rel_srt}:force_style="
+        "'FontName=Amiri,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+        "BackColour=&H66000000,BorderStyle=3,Outline=2,Shadow=1,Alignment=2,MarginV=45'"
     )
 
-@bot.message_handler(func=lambda message: True)
-def make_documentary(message):
-    raw_topic = (message.text or "").strip()
-    if not raw_topic or raw_topic.startswith('/'):
-        return
+    # فلتر تفخيم وتنعيم الصوت البشري
+    audio_fx = "equalizer=f=90:width_type=h:width=180:g=3,equalizer=f=3200:width_type=h:width=900:g=2,acompressor,apad=pad_dur=0.25"
 
-    topic = clean_arabic_text(raw_topic)
-    chat_id = message.chat.id
-    status_msg = bot.reply_to(
-        message,
-        f"🎬 جاري إنتاج الوثائقي الموسّع (6 مشاهد): ({topic})\n\n1️⃣ تأليف السرد الوثائقي المتصل..."
-    )
-
-    scenes = generate_documentary_plan(topic)
-    script_preview = "\n".join([f"• {s['narration']}" for s in scenes])
+    if media_info["type"] == "video":
+        vf_chain = (
+            "scale=720:1280:force_original_aspect_ratio=increase,"
+            "crop=720:1280:(iw-ow)/2:(ih-oh)*0.35,"
+            "eq=contrast=1.08:saturation=0.95:brightness=-0.02,"
+            f"{sub_style},"
+            f"fade=t=in:st=0:d=0.35,fade=t=out:st={fade_out_st:.2f}:d=0.35"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", rel_media,
+            "-i", rel_audio,
+            "-vf", vf_chain,
+            "-af", audio_fx,
+            "-t", f"{duration:.2f}",
+            "-r", str(fps),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+            "-c:a", "aac", "-b:a", "160k",
+            "-pix_fmt", "yuv420p",
+            rel_out
+        ]
+    else:
+        moves = [
+            f"z='1.0+0.32*(on/{frames})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+            f"z='1.32-0.32*(on/{frames})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+            f"z='1.24':x='(iw-iw/zoom)*(on/{frames})':y='(ih-ih/zoom)/2'",
+            f"z='1.24':x='(iw-iw/zoom)*(1-on/{frames})':y='(ih-ih/zoom)/2'"
+        ]
+        chosen_move = moves[scene_idx % len(moves)]
+        vf_chain = (
+            "scale=900:1600,"
+            f"zoompan={chosen_move}:d={frames}:s=720x1280:fps={fps},"
+            "eq=contrast=1.06:saturation=1.05,"
+            f"{sub_style},"
+            f"fade=t=in:st=0:d=0.35,fade=t=out:st={fade_out_st:.2f}:d=0.35"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", rel_media,
+            "-i", rel_audio,
+            "-vf", vf_chain,
+            "-af", audio_fx,
+            "-t", f"{duration:.2f}",
+            "-r", str(fps),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+            "-c:a", "aac", "-b:a", "160k",
+            "-pix_fmt", "yuv420p",
+            rel_out
+        ]
 
     try:
+        subprocess.run(cmd, cwd=work_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+    except subprocess.CalledProcessError:
+        # في حال حدوث أي مشكلة نادرة في الخط، يتم تصدير المشهد فوراً بدون توقف
+        safe_vf = vf_chain.replace(f"{sub_style},", "")
+        cmd[cmd.index("-vf") + 1] = safe_vf
+        subprocess.run(cmd, cwd=work_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+
+# ==========================================
+# 6. نظام الرفع العملاق (حتى 2GB + تقسيم ذكي)
+# ==========================================
+def send_large_video_safely(chat_id, video_path, caption_text, reply_to_id):
+    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+
+    # 1. إذا كان الحجم أقل من 49 ميجابايت، يُرفع مباشرة عبر البوت
+    if file_size_mb <= 49.0:
+        with open(video_path, "rb") as vf:
+            bot.send_video(chat_id, vf, caption=caption_text, reply_to_message_id=reply_to_id, timeout=180)
+        return
+
+    # 2. إذا توفرت مفاتيح Pyrogram (2GB MTProto)، يُرفع كملف واحد حتى 2000 ميجابايت
+    if tg_api_id and tg_api_hash:
+        try:
+            from pyrogram import Client
+            async def _upload_mtproto():
+                async with Client("zakaria_2gb_uploader", api_id=int(tg_api_id), api_hash=tg_api_hash, bot_token=bot_token, in_memory=True) as app:
+                    await app.send_video(chat_id=chat_id, video=video_path, caption=caption_text)
+            asyncio.run(_upload_mtproto())
+            return
+        except Exception:
+            pass
+
+    # 3. التقسيم الأوتوماتيكي الذكي بدون فقدان جودة إذا تجاوز 49 ميجابايت بدون مفاتيح إضافية
+    work_dir = os.path.dirname(video_path)
+    part_pattern = os.path.join(work_dir, "part_%02d.mp4")
+    subprocess.run([
+        "ffmpeg", "-y", "-i", video_path,
+        "-c", "copy", "-map", "0",
+        "-f", "segment", "-segment_time", "180",
+        "-reset_timestamps", "1", part_pattern
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+
+    parts = sorted([os.path.join(work_dir, f) for f in os.listdir(work_dir) if f.startswith("part_") and f.endswith(".mp4")])
+    for idx, p_file in enumerate(parts, 1):
+        with open(p_file, "rb") as pf:
+            bot.send_video(
+                chat_id, pf,
+                caption=f"{caption_text}\n📦 الجزء ({idx}/{len(parts)})",
+                reply_to_message_id=reply_to_id, timeout=180
+            )
+
+# ==========================================
+# 7. إدارة الحوار التفاعلي (الموضوع -> المتبقي -> المدة -> الإنتاج)
+# ==========================================
+def build_duration_keyboard():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("⚡ 30 ثانية (4 مشاهد)", callback_data="dur_0.5"),
+        InlineKeyboardButton("🎬 1 دقيقة (8 مشاهد)", callback_data="dur_1"),
+        InlineKeyboardButton("🍿 2 دقيقة (14 مشهداً)", callback_data="dur_2"),
+        InlineKeyboardButton("🎥 3 دقائق (20 مشهداً)", callback_data="dur_3"),
+        InlineKeyboardButton("🏛️ 5 دقائق (32 مشهداً)", callback_data="dur_5"),
+        InlineKeyboardButton("👑 10 دقائق (60 مشهداً)", callback_data="dur_10")
+    )
+    return markup
+
+@bot.message_handler(commands=['start', 'status'])
+def handle_start(message):
+    if not is_authorized(message):
+        bot.reply_to(message, "🔒 عذراً، هذا الاستوديو الشخصي خاص بزكريا فقط.")
+        return
+
+    USER_SESSION[message.chat.id] = {"step": "awaiting_topic"}
+    welcome = (
+        f"أهلاً بك يا زكريا في استوديو الإنتاج السينمائي الشخصي (Level 5 Pro)! 🎬👑\n\n"
+        f"{get_quota_dashboard_text()}\n\n"
+        "✍️ **الخطوة الأولى:**\n"
+        "ما هو موضوع الفيلم أو القصة التي تريد صناعتها الآن؟ (أرسل اسم الموضوع في رسالة)"
+    )
+    bot.reply_to(message, welcome)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("dur_"))
+def handle_duration_button(call):
+    chat_id = call.message.chat.id
+    session = USER_SESSION.get(chat_id)
+    if not session or "topic" not in session:
+        bot.answer_callback_query(call.id, "أرسل موضوع الفيلم أولاً!")
+        return
+
+    mins = float(call.data.replace("dur_", ""))
+    bot.answer_callback_query(call.id, f"تم اختيار المدة: {mins} دقيقة")
+    USER_SESSION[chat_id]["step"] = "producing"
+    produce_full_movie(chat_id, session["topic"], mins, call.message)
+
+@bot.message_handler(func=lambda message: True)
+def handle_conversation(message):
+    if not is_authorized(message):
+        bot.reply_to(message, "🔒 هذا البوت خاص بصاحبه فقط.")
+        return
+
+    chat_id = message.chat.id
+    text = (message.text or "").strip()
+    if not text or text.startswith('/'):
+        return
+
+    session = USER_SESSION.get(chat_id, {"step": "awaiting_topic"})
+
+    # إذا كان البوت ينتظر إدخال المدة يدوياً
+    if session.get("step") == "awaiting_duration" and "topic" in session:
+        nums = re.findall(r"[\d\.]+", text)
+        if nums:
+            val = float(nums[0])
+            mins = val / 60.0 if ("ثان" in text or val > 20) else val
+            mins = max(0.4, min(mins, 20.0))
+            USER_SESSION[chat_id]["step"] = "producing"
+            produce_full_movie(chat_id, session["topic"], mins, message)
+            return
+
+    # حفظ الموضوع الجديد وعرض المتبقي وسؤال المدة
+    topic = clean_arabic(text)
+    USER_SESSION[chat_id] = {"step": "awaiting_duration", "topic": topic}
+
+    prompt_msg = (
+        f"✅ **تم اعتماد الموضوع:** ({topic})\n\n"
+        f"{get_quota_dashboard_text()}\n\n"
+        "⏱️ **الخطوة الثانية: كم تريد مدة هذا الفيديو؟**\n"
+        "اختر المدة من الأزرار بالأسفل، أو اكتب المدة التي تريدها مباشرة (مثلاً: `4 دقائق` أو `45 ثانية`):"
+    )
+    bot.reply_to(message, prompt_msg, reply_markup=build_duration_keyboard())
+
+def produce_full_movie(chat_id, topic, duration_minutes, trigger_msg):
+    # حساب عدد المشاهد بدقة (كل مشهد حوالي 8 ثوانٍ)
+    total_target_seconds = int(duration_minutes * 60)
+    num_scenes = max(3, min(int(round(total_target_seconds / 8.0)), 65))
+
+    status_msg = bot.send_message(
+        chat_id,
+        f"🚀 **بدأ خط الإنتاج السينمائي!**\n"
+        f"📌 الموضوع: {topic}\n"
+        f"⏱️ المدة المطلوبة: {duration_minutes:.1f} دقيقة ({num_scenes} مشهداً)\n\n"
+        f"1️⃣ جاري تأليف السيناريو وتوزيع أدوار الشخصيات..."
+    )
+
+    work_dir = os.path.abspath(f"studio_{chat_id}_{int(time.time())}")
+    os.makedirs(work_dir, exist_ok=True)
+    clips = []
+
+    try:
+        scenes = generate_storyboard(topic, num_scenes)
+
+        for i, scene in enumerate(scenes):
+            try:
+                bot.edit_message_text(
+                    f"🎬 **جاري إنتاج الفيلم:** ({topic})\n"
+                    f"⏳ تقدم العمل: المشهد `{i+1}` من `{num_scenes}`\n"
+                    f"🗣️ الشخصية الحالية: `{scene['character']}`\n"
+                    f"📝 النص: _{scene['text'][:80]}..._",
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id
+                )
+            except Exception:
+                pass
+
+            aud_path = os.path.join(work_dir, f"aud_{i}.mp3")
+            srt_path = os.path.join(work_dir, f"subs_{i}.srt")
+            clip_path = os.path.join(work_dir, f"clip_{i}.mp4")
+
+            dur = generate_voice_and_srt(scene["text"], scene["character"], aud_path, srt_path)
+            media = fetch_scene_media(scene, i, work_dir)
+            render_scene_clip(media, aud_path, srt_path, clip_path, dur, i, work_dir)
+            clips.append(clip_path)
+
         bot.edit_message_text(
-            f"✅ تم تأليف النص الوثائقي (6 مشاهد):\n\n{script_preview}\n\n2️⃣ جاري الآن تسجيل الصوت البشري المتصل، وتوليد 6 صور، وتطبيق 6 حركات كاميرا سينمائية... ⏳🎥",
+            "🔄 اكتملت المشاهد! جاري الآن الدمج النهائي وإضافة اللمسة الصوتية ورفع الفيديو... ⏳🎥",
             chat_id=chat_id,
             message_id=status_msg.message_id
         )
-    except Exception:
-        pass
 
-    work_dir = f"doc_{chat_id}_{int(time.time())}"
-    os.makedirs(work_dir, exist_ok=True)
+        list_txt = os.path.join(work_dir, "concat_list.txt")
+        with open(list_txt, "w", encoding="utf-8") as lf:
+            for c in clips:
+                lf.write(f"file '{os.path.basename(c)}'\n")
 
-    try:
-        # أ) توليد الصوت البشري المتصل في ملف واحد
-        master_audio = os.path.join(work_dir, "master_voice.mp3")
-        generate_continuous_human_voice(scenes, master_audio)
-        total_audio_dur = get_audio_duration(master_audio)
-
-        # ب) جلب الـ 6 صور
-        image_paths = download_all_scene_images(scenes, topic, work_dir)
-
-        # ج) توزيع زمن الصوت على المشاهد الـ 6 بدقة حسب طول كل جملة
-        char_counts = [max(len(s["narration"]), 10) for s in scenes]
-        total_chars = sum(char_counts)
-        segment_files = []
-
-        for i, img_path in enumerate(image_paths):
-            scene_dur = max(total_audio_dur * (char_counts[i] / total_chars), 3.2)
-            seg_path = os.path.join(work_dir, f"seg_{i}.mp4")
-            render_animated_scene(img_path, scene_dur, i, seg_path)
-            segment_files.append(seg_path)
-
-        # د) دمج المشاهد الـ 6 المتحركة مع الشريط الصوتي البشري المتصل
-        concat_list = os.path.join(work_dir, "list.txt")
-        with open(concat_list, "w", encoding="utf-8") as f:
-            for seg in segment_files:
-                f.write(f"file '{os.path.abspath(seg)}'\n")
-
-        silent_video = os.path.join(work_dir, "visuals.mp4")
+        merged_video = os.path.join(work_dir, "merged.mp4")
         subprocess.run([
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", concat_list, "-c", "copy", silent_video
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+            "-i", "concat_list.txt", "-c", "copy", "merged.mp4"
+        ], cwd=work_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
 
-        final_video = os.path.join(work_dir, "final_doc.mp4")
-        subprocess.run([
+        # إضافة خلفية صوتية سينمائية دافئة وهادئة جداً تحت صوت المعلق
+        final_video = os.path.join(work_dir, "final_cinema.mp4")
+        ambience_cmd = [
             "ffmpeg", "-y",
-            "-i", silent_video,
-            "-i", master_audio,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-shortest", final_video
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+            "-i", "merged.mp4",
+            "-f", "lavfi", "-i", "anoisesrc=color=brown:amplitude=0.015",
+            "-filter_complex", "[1:a]lowpass=f=240[bg];[0:a][bg]amix=inputs=2:duration=first:weights=1 0.12[aout]",
+            "-map", "0:v", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+            "final_cinema.mp4"
+        ]
+        try:
+            subprocess.run(ambience_cmd, cwd=work_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        except Exception:
+            final_video = merged_video
 
-        with open(final_video, "rb") as vf:
-            bot.send_video(
-                chat_id,
-                vf,
-                caption=f"🎬 الوثائقي الكامل (6 مشاهد متحركة): {topic}\n🎙️ تعليق صوتي بشري متصل\n\n📝 النص:\n{script_preview[:750]}",
-                reply_to_message_id=message.message_id
-            )
+        QUOTA_STATS["videos_produced"] += 1
+        caption = (
+            f"🎉 **تم إنتاج فيلمك السينمائي بنجاح!**\n"
+            f"📌 الموضوع: {topic}\n"
+            f"🎞️ عدد المشاهد: {num_scenes} مشهداً (فيديوهات Pixabay + صور Flux + ترجمة + أصوات متعددة)\n\n"
+            f"{get_quota_dashboard_text()}"
+        )
+
+        send_large_video_safely(chat_id, final_video, caption, trigger_msg.message_id)
 
         try:
             bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
@@ -427,16 +624,13 @@ def make_documentary(message):
             pass
 
     except Exception as e:
-        bot.edit_message_text(
-            f"⚠️ حدث خطأ أثناء الإنتاج: {str(e)[:160]}",
-            chat_id=chat_id,
-            message_id=status_msg.message_id
-        )
+        bot.edit_message_text(f"⚠️ حدث خطأ غير متوقع: {str(e)[:200]}", chat_id=chat_id, message_id=status_msg.message_id)
     finally:
+        USER_SESSION[chat_id] = {"step": "awaiting_topic"}
         shutil.rmtree(work_dir, ignore_errors=True)
 
 if __name__ == "__main__":
-    print("AutoDoc Cinema v3 Engine is running...")
+    print("Zakaria Personal Cinema Studio Level 5 is running...")
     while True:
         try:
             bot.remove_webhook()
