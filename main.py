@@ -1,30 +1,15 @@
 import os
 import io
-import sys
-import json
 import time
 import shutil
 import subprocess
 import urllib.parse
-
-# 1. التثبيت الذاتي للمكتبات الناقصة لمنع توقف Run AutoDoc Engine
-for pkg, mod in [
-    ("pyTelegramBotAPI", "telebot"),
-    ("requests", "requests"),
-    ("gTTS", "gtts"),
-    ("Pillow", "PIL")
-]:
-    try:
-        __import__(mod)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-
 import telebot
 import requests
 from gtts import gTTS
 from PIL import Image, ImageDraw
 
-# 2. جلب المفاتيح السرية
+# 1. جلب المفاتيح السرية
 bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 gemini_key = os.environ.get('GEMINI_API_KEY', '').strip()
 supabase_key = os.environ.get('SUPABASE_KEY', '').strip()
@@ -32,99 +17,66 @@ supabase_url = "https://maabijsnlytxewkscvam.supabase.co"
 
 bot = telebot.TeleBot(bot_token)
 
-# 3. محرك الذكاء الاصطناعي بالاكتشاف التلقائي وتجاوز خطأ 429
+# 2. الاتصال المباشر بموديلات Gemini الفعالة على مفتاحك
 def call_gemini(prompt_text):
-    list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={gemini_key}"
-    available_models = []
-    try:
-        r = requests.get(list_url, timeout=10)
-        if r.status_code == 200:
-            for m in r.json().get('models', []):
-                if 'generateContent' in m.get('supportedGenerationMethods', []):
-                    name = m['name'].replace('models/', '')
-                    if 'gemini' in name and 'embedding' not in name and 'imagen' not in name:
-                        available_models.append(name)
-    except Exception:
-        pass
-
-    priority = [
+    models = [
         'gemini-2.5-flash-lite',
-        'gemini-2.0-flash-lite',
         'gemini-2.5-flash',
-        'gemini-2.0-flash',
         'gemini-flash-latest',
         'gemini-2.5-pro'
     ]
-    models_to_try = [m for m in priority if m in available_models] + [m for m in available_models if m not in priority]
-    if not models_to_try:
-        models_to_try = priority
-
     payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
 
-    for attempt in range(2):
-        for model_name in models_to_try[:6]:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
-            try:
-                res = requests.post(url, json=payload, timeout=25)
-                if res.status_code == 200:
-                    return res.json()['candidates'][0]['content']['parts'][0]['text']
-                elif res.status_code == 429:
-                    time.sleep(2)
-            except Exception:
-                continue
-        time.sleep(3)
+    for model_name in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
+        try:
+            res = requests.post(url, json=payload, timeout=20)
+            if res.status_code == 200:
+                return res.json()['candidates'][0]['content']['parts'][0]['text']
+            elif res.status_code == 429:
+                time.sleep(2)
+        except Exception:
+            continue
     return None
 
-# 4. توليد السيناريو الوثائقي مع بديل احتياطي مضمون
+# 3. كتابة السيناريو بطريقة نصية مضمونة 100% بدون أخطاء JSON
 def generate_script(topic):
-    prompt = f"""
-اكتب سيناريو فيديو وثائقي قصير ومشوق من 3 مشاهد حول الموضوع التالي: "{topic}".
-أجب بصيغة JSON فقط بهذا الشكل الدقيق دون أي نص خارجه:
-[
-  {{
-    "narration": "نص التعليق الصوتي للمشهد الأول باللغة العربية الفصحى (جملتان مشوقتان)",
-    "image_prompt": "Cinematic documentary photography of {topic} scene 1, realistic, high detail, vertical"
-  }},
-  {{
-    "narration": "نص التعليق الصوتي للمشهد الثاني باللغة العربية الفصحى (جملتان غنيتان بالمعلومات)",
-    "image_prompt": "Cinematic documentary photography of {topic} historical or deep view scene 2, realistic, vertical"
-  }},
-  {{
-    "narration": "نص التعليق الصوتي للمشهد الثالث والخاتمة باللغة العربية الفصحى (جملتان مؤثرتان)",
-    "image_prompt": "Cinematic documentary photography of {topic} epic finale scene 3, realistic, vertical"
-  }}
-]
-"""
+    prompt = (
+        f"اكتب 3 فقرات قصيرة جداً ومشوقة باللغة العربية الفصحى لفيلم وثائقي عن: {topic}.\n"
+        "اجعل كل فقرة في سطر مستقل يبدأ بكلمة SCENE: فقط بدون أي ترقيم أو مقدمات."
+    )
     raw = call_gemini(prompt)
+    scenes = []
     if raw:
-        try:
-            clean = raw.strip()
-            start = clean.find('[')
-            end = clean.rfind(']') + 1
-            if start != -1 and end > start:
-                parsed = json.loads(clean[start:end])
-                if isinstance(parsed, list) and len(parsed) > 0:
-                    return parsed
-        except Exception:
-            pass
+        for line in raw.splitlines():
+            clean = line.replace("SCENE:", "").replace("*", "").strip()
+            if len(clean) > 20:
+                scenes.append(clean)
 
-    # سيناريو احتياطي تلقائي لضمان إنتاج الفيديو حتى لو كانت سيرفرات جوجل مضغوطة (429)
+    # ضمان وجود 3 مشاهد دائماً حتى في أوقات ضغط السيرفر
+    if len(scenes) < 3:
+        scenes = [
+            f"نأخذكم اليوم في رحلة وثائقية خاصة لاستكشاف تاريخ وأسرار {topic} وما يحمله من معالم خالدة.",
+            f"تتجلى في {topic} تفاصيل عريقة تجمع بين أصالة الماضي وروعة المكان التي تدهش كل من يشاهدها.",
+            f"يبقى {topic} رمزاً حياً وشاهداً تاريخياً يروي للأجيال قصة حضارة لا تُنسى عبر العصور."
+        ]
+
     return [
         {
-            "narration": f"في هذا الوثائقي الخاص، نأخذكم في رحلة استثنائية لاستكشاف {topic} وما يحمله من تفاصيل مذهلة.",
-            "image_prompt": f"Cinematic wide documentary shot of {topic}, ultra realistic, 8k, vertical"
+            "narration": scenes[0],
+            "image_prompt": f"Cinematic documentary wide shot of {topic}, historical architecture and nature, realistic, 8k, vertical"
         },
         {
-            "narration": f"تتشابك الأحداث والحقائق حول {topic} لتكشف لنا جوانب عميقة لم تكن معروفة من قبل لدى الكثيرين.",
-            "image_prompt": f"Dramatic detailed documentary close up representing {topic}, cinematic lighting, vertical"
+            "narration": scenes[1],
+            "image_prompt": f"Detailed documentary photography of {topic} landmarks and culture, dramatic lighting, realistic, vertical"
         },
         {
-            "narration": f"ويبقى {topic} شاهداً حياً يثير الدهشة والتأمل، ويترك بصمة خالدة في سجل التاريخ والمعرفة.",
-            "image_prompt": f"Epic sunset documentary finale shot of {topic}, cinematic masterpiece, vertical"
+            "narration": scenes[2],
+            "image_prompt": f"Epic golden hour sunset documentary view of {topic}, masterpiece photography, vertical"
         }
     ]
 
-# 5. توليد وفحص الصور لضمان توافقها التام مع FFmpeg
+# 4. توليد وحفظ الصور بأبعاد قياسية للمونتاج
 def create_scene_image(prompt_en, output_path):
     try:
         encoded = urllib.parse.quote(prompt_en)
@@ -138,14 +90,13 @@ def create_scene_image(prompt_en, output_path):
     except Exception:
         pass
 
-    # تصميم خلفية سينمائية احتياطية صالحة 100% للمونتاج
     img = Image.new('RGB', (720, 1280), color=(15, 23, 42))
     draw = ImageDraw.Draw(img)
     draw.rectangle([30, 30, 690, 1250], outline=(212, 175, 55), width=6)
     draw.rectangle([50, 50, 670, 1230], outline=(56, 189, 248), width=2)
     img.save(output_path, "JPEG", quality=90)
 
-# 6. أمر البداية /start
+# 5. أمر البداية /start
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
@@ -169,15 +120,13 @@ def send_welcome(message):
         pass
 
     welcome_msg = (
-        f"أهلاً بك يا {first_name} في مصنع الوثائقيات الآلي الشامل! 🎬🚀\n\n"
-        "✅ العقل (Gemini): متصل\n"
-        "✅ الذاكرة (Supabase): متصلة\n"
-        "✅ محرك الفيديو (FFmpeg): جاهز للإنتاج السريع\n\n"
-        "📌 أرسل الآن أي عنوان وثائقي في رسالة عادية (مثل: تاريخ مدينة تعز) ليتم صناعة الفيديو وإرساله لك فوراً!"
+        f"أهلاً بك يا {first_name} في مصنع الوثائقيات الآلي (الإصدار النهائي الشامل)! 🎬🚀\n\n"
+        "✅ العقل والذاكرة ومحرك الفيديو جاهزون تماماً.\n"
+        "📌 أرسل الآن اسم الموضوع (مثل: مدينة تعز) ليبدأ تصنيع وإرسال الفيديو فوراً!"
     )
     bot.reply_to(message, welcome_msg)
 
-# 7. صناعة الفيديو الوثائقي الكامل (صوت + صورة + مونتاج MP4)
+# 6. إنتاج الفيديو الوثائقي الكامل وإرساله
 @bot.message_handler(func=lambda message: True)
 def make_documentary(message):
     topic = (message.text or "").strip()
@@ -187,15 +136,15 @@ def make_documentary(message):
     chat_id = message.chat.id
     status_msg = bot.reply_to(
         message,
-        f"⏳ جاري العمل على وثائقي: ({topic})\n\n1️⃣ كتابة السيناريو الوثائقي..."
+        f"⏳ تم استلام الموضوع: ({topic})\n\n1️⃣ جاري تأليف السيناريو الوثائقي..."
     )
 
     scenes = generate_script(topic)
-    script_preview = "\n\n".join([f"🔹 المشهد {i+1}: {s.get('narration', '')}" for i, s in enumerate(scenes)])
+    script_preview = "\n\n".join([f"🔹 المشهد {i+1}: {s['narration']}" for i, s in enumerate(scenes)])
 
     try:
         bot.edit_message_text(
-            f"✅ تم تجهيز السيناريو:\n\n{script_preview}\n\n2️⃣ جاري الآن تسجيل الصوت وتوليد الصور ومونتاج الفيديو (FFmpeg)... 🎬⏳",
+            f"✅ تم تجهيز السيناريو:\n\n{script_preview}\n\n2️⃣ جاري الآن تسجيل التعليق الصوتي وتوليد الصور ومونتاج الفيديو... 🎬⏳",
             chat_id=chat_id,
             message_id=status_msg.message_id
         )
@@ -208,21 +157,13 @@ def make_documentary(message):
 
     try:
         for i, scene in enumerate(scenes):
-            narration = scene.get('narration', '').strip() or f"مشهد وثائقي حول {topic}"
-            img_prompt = scene.get('image_prompt', '').strip() or f"Documentary photography of {topic}"
-
             audio_path = os.path.join(work_dir, f"audio_{i}.mp3")
             img_path = os.path.join(work_dir, f"img_{i}.jpg")
             seg_path = os.path.join(work_dir, f"seg_{i}.mp4")
 
-            # تحويل النص إلى تعليق صوتي عربي
-            tts = gTTS(text=narration, lang='ar')
-            tts.save(audio_path)
+            gTTS(text=scene['narration'], lang='ar').save(audio_path)
+            create_scene_image(scene['image_prompt'], img_path)
 
-            # توليد وحفظ الصورة بأبعاد قياسية
-            create_scene_image(img_prompt, img_path)
-
-            # دمج الصوت والصورة بسرعة فائقة عبر ultrafast
             cmd = [
                 "ffmpeg", "-y",
                 "-loop", "1", "-framerate", "24", "-i", img_path,
@@ -236,7 +177,6 @@ def make_documentary(message):
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
             segment_files.append(seg_path)
 
-        # دمج المشاهد الثلاثة في ملف MP4 نهائي
         concat_file = os.path.join(work_dir, "list.txt")
         with open(concat_file, "w", encoding="utf-8") as f:
             for seg in segment_files:
@@ -249,7 +189,6 @@ def make_documentary(message):
         ]
         subprocess.run(concat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
 
-        # إرسال ملف الفيديو النهائي للمستخدم
         with open(final_video, "rb") as vf:
             bot.send_video(
                 chat_id,
@@ -265,7 +204,7 @@ def make_documentary(message):
 
     except Exception as e:
         bot.edit_message_text(
-            f"⚠️ تعذر إكمال المونتاج بسبب: {str(e)[:200]}",
+            f"⚠️ حدث خطأ فني أثناء المونتاج: {str(e)[:150]}",
             chat_id=chat_id,
             message_id=status_msg.message_id
         )
@@ -273,10 +212,11 @@ def make_documentary(message):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 if __name__ == "__main__":
-    print("Starting AutoDoc Video Factory...")
-    try:
-        bot.remove_webhook()
-        time.sleep(1)
-    except Exception:
-        pass
-    bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
+    print("AutoDoc Engine is active...")
+    while True:
+        try:
+            bot.remove_webhook()
+            bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
+        except Exception as e:
+            print(f"Polling restart: {e}")
+            time.sleep(5)
